@@ -1,0 +1,92 @@
+{
+    "version": "3.0_enhanced_small_account",
+    "system": {
+        "debug_mode": true,
+        "max_threads": 4,
+        "memory_limit_mb": 2048,
+        "performance_mode": "balanced",
+        "model_validation_enabled": true
+    },
+    "account": {
+        "server": "Exness-MT5Trial9",
+        "login": 210265375,
+        "password": "Glo@1234567890",
+        "risk_per_trade": 0.01,
+        "max_daily_trades": 12,
+        "min_account_balance": 40.0,
+        "balance_protection": true,
+        "position_sizing": "volatility_adjusted"
+    },
+    "trading": {
+        "symbols": [
+            "XAUUSDm"
+        ],
+        "timeframes": [
+            "M5",
+            "M15",
+            "M30"
+        ],
+        "max_simultaneous_trades": 3,
+        "max_trades_per_symbol": 2,
+        "strategy": "ULTRA_FORCED_MEAN_REVERSION",
+        "session_weights": {
+            "london": 1.2,
+            "newyork": 1.1,
+            "asian": 0.8
+        }
+    },
+    "ml_settings": {
+        "confidence_threshold": {
+            "XAUUSDm": 0.25
+        },
+        "dynamic_threshold_adjustment": true,
+        "ensemble_strategy": "weighted_average",
+        "feature_importance_min": 0.02,
+        "model_validation_threshold": 0.5,
+        "online_learning_enabled": true
+    },
+    "risk_management": {
+        "max_drawdown": 0.2,
+        "daily_loss_limit": 0.08,
+        "position_sizing": "confidence_based",
+        "volatility_multiplier": 1.5,
+        "correlation_limit": 0.8
+    },
+    "adaptive_learning": {
+        "retrain_interval": 100,
+        "learning_rate_decay": 0.995,
+        "memory_window": 500,
+        "drift_detection_enabled": true,
+        "performance_monitoring": true
+    },
+    "data_settings": {
+        "base_directory": "dataFiles",
+        "required_columns": [
+            "setuptime",
+            "asset",
+            "atr",
+            "rsi",
+            "hittp",
+            "volumeratio"
+        ],
+        "min_data_points": {
+            "M5": 200,
+            "M15": 120,
+            "M30": 100
+        },
+        "validation_enabled": true,
+        "quality_threshold": 0.8
+    },
+    "ultra_forced_settings": {
+        "rsi_thresholds": {
+            "oversold": 25,
+            "overbought": 75
+        },
+        "volatility_threshold": 0.002,
+        "volume_ratio": {
+            "min": 0.5,
+            "max": 2.0
+        },
+        "expected_win_rate": 0.35
+    }
+}
