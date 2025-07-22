@@ -10,7 +10,7 @@
     "account": {
         "server": "Exness-MT5Trial9",
         "login": 210265375,
-        "password": "Glo@1234567890",
+        "password": "",
         "risk_per_trade": 0.01,
         "max_daily_trades": 12,
         "min_account_balance": 40.0,
