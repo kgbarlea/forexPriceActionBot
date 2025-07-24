@@ -797,7 +797,7 @@ class EnhancedRiskManager:
             if recent_drawdown > 0.1:  # 10% drawdown
                 dd_adjustment = 0.7  # Significantly reduce risk
             elif recent_drawdown > 0.05:  # 5% drawdown
-                dd_adjustment = 0.85  # Moderately reduce risk
+                dd_adjustment = 0.45  # More aggressive risk reduction
             else:
                 dd_adjustment = 1.0
             
@@ -842,6 +842,506 @@ class EnhancedRiskManager:
 # ================== MAIN TRADING SYSTEM ==================
 
 class EnhancedAdaptiveMLTradingSystem:
+    def __init__(self, config_file='adaptive_ml_trading_config.json'):
+        """
+        Initialize the trading system and load canonical feature columns from training.
+        """
+        # ... existing initialization code ...
+        self.feature_columns = []
+        # Load canonical feature columns from training if available
+        try:
+            with open('feature_columns.json', 'r') as f:
+                self.feature_columns = json.load(f)
+            print(f"✅ Loaded {len(self.feature_columns)} canonical feature columns from training.")
+        except Exception as e:
+            print(f"⚠️ Could not load feature_columns.json: {e}")
+        # Load dual-model components
+        try:
+            import joblib
+            self.signal_finder_package = joblib.load('signal_finder_model.pkl')
+            self.signal_finder = self.signal_finder_package['model']
+            self.signal_finder_scaler = self.signal_finder_package['scaler']
+            self.signal_finder_features = self.signal_finder_package['feature_columns']
+            self.signal_finder_threshold = self.signal_finder_package['optimal_threshold']
+            print(f"✅ Signal Finder model loaded for dual-model integration.")
+        except Exception as e:
+            print(f"⚠️ Could not load signal_finder_model.pkl: {e}")
+            self.signal_finder = None
+        try:
+            self.main_model_package = joblib.load('production_models_latest.pkl')
+            self.main_model = self.main_model_package['models']['timeframe_ensemble']
+            self.main_scaler = self.main_model_package['scaler']
+            self.main_features = self.main_model_package['feature_columns']
+            print(f"✅ Main Precision model loaded for dual-model integration.")
+        except Exception as e:
+            print(f"⚠️ Could not load production_models_latest.pkl: {e}")
+            self.main_model = None
+
+    def dual_model_predict(self, X):
+        """
+        Dual-model prediction: only return signals that pass both the signal finder and main model.
+        X: DataFrame with live features (columns must include all required by both models)
+        Returns: dict with dual_predictions, dual_confidence, and details from both models
+        """
+        import numpy as np
+        import pandas as pd
+        # Prepare features for signal finder
+        sf_features = [col for col in self.signal_finder_features if col in X.columns]
+        X_sf = X[sf_features].copy()
+        # Fill missing features with 0
+        for col in self.signal_finder_features:
+            if col not in X_sf.columns:
+                X_sf[col] = 0
+        X_sf = X_sf[self.signal_finder_features]
+        # Scale
+        X_sf_scaled = self.signal_finder_scaler.transform(X_sf)
+        sf_probs = self.signal_finder.predict_proba(X_sf_scaled)[:, 1]
+        sf_preds = (sf_probs >= self.signal_finder_threshold).astype(int)
+        # Prepare features for main model
+        main_features = [col for col in self.main_features if col in X.columns]
+        X_main = X[main_features].copy()
+        for col in self.main_features:
+            if col not in X_main.columns:
+                X_main[col] = 0
+        X_main = X_main[self.main_features]
+        X_main_scaled = self.main_scaler.transform(X_main)
+        main_probs = self.main_model.predict_proba(X_main_scaled)[:, 1]
+        main_preds = (main_probs >= 0.5).astype(int)
+        # Dual filter: only signals that pass both
+        dual_predictions = (sf_preds == 1) & (main_preds == 1)
+        dual_confidence = np.where(dual_predictions, main_probs, 0)
+        return {
+            'dual_predictions': dual_predictions,
+            'dual_confidence': dual_confidence,
+            'signal_finder_probs': sf_probs,
+            'main_model_probs': main_probs
+        }
+    def _calculate_position_size(self, symbol, confidence):
+        """Position sizing optimized for small accounts"""
+        account = mt5.account_info()
+        risk_amount = account.balance * self.risk_per_trade
+        # Get symbol info
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return 0.01  # Default to minimum
+        # Calculate position size based on stop distance
+        stop_distance = symbol_info.point * 100  # 100 pips as example
+        if stop_distance == 0:
+            return 0.01
+        # Convert risk amount to lots
+        tick_value = symbol_info.trade_tick_value
+        if tick_value == 0:
+            return 0.01
+        lots = (risk_amount / stop_distance) / tick_value
+        # Apply confidence multiplier
+        lots *= min(2.0, confidence * 2)  # Scale up to 2x for high confidence
+        # Ensure within broker limits
+        lots = max(symbol_info.volume_min, min(symbol_info.volume_max, lots))
+        # Round to nearest 0.01
+        return round(lots * 100) / 100
+    def scan_all_symbols(self):
+        """Scan all configured symbols and timeframes, always providing the full feature set for each scan."""
+        signals = []
+        for symbol in self.config['trading']['symbols']:
+            for timeframe in self.config['trading']['timeframes']:
+                try:
+                    # Get market data
+                    data = self.get_live_market_data(symbol, timeframe, bars=100)
+                    if data is None or len(data) < 20:
+                        continue
+                    # Generate features for this (symbol, timeframe)
+                    features = self.calculate_live_features(symbol, timeframe, data)
+                    if not features:
+                        continue
+                    # Build full feature vector for model
+                    feature_vector = {col: features.get(col, 0) for col in self.feature_columns}
+                    # Log missing features for this scan
+                    missing = [col for col in self.feature_columns if col not in features]
+                    if missing:
+                        print(f"⚠️ For {symbol} {timeframe}, missing features filled with 0: {missing}")
+                    X = pd.DataFrame([feature_vector])
+                    # Use dual-model prediction if available, else fallback
+                    if hasattr(self, 'dual_model_predict'):
+                        result = self.dual_model_predict(X)
+                        # Only add signals that pass both models
+                        if result and result['dual_predictions'][0]:
+                            signals.append({
+                                'symbol': symbol,
+                                'timeframe': timeframe,
+                                'direction': 'BUY' if result['dual_confidence'][0] > 0 else 'SELL',
+                                'confidence': float(result['dual_confidence'][0]),
+                                'features': feature_vector,
+                                'timestamp': datetime.now()
+                            })
+                            if self.debug_mode:
+                                print(f"Dual-model signal: {symbol} {timeframe} Confidence: {result['dual_confidence'][0]:.2f}")
+                    else:
+                        # Fallback to single-model prediction
+                        prediction = self.predict_with_ensemble(features, symbol, timeframe)
+                        if prediction['confidence'] >= self._get_dynamic_threshold(symbol, timeframe):
+                            signals.append({
+                                'symbol': symbol,
+                                'timeframe': timeframe,
+                                'direction': prediction['direction'],
+                                'confidence': prediction['confidence'],
+                                'features': features,
+                                'timestamp': datetime.now()
+                            })
+                            if self.debug_mode:
+                                print(f"Signal found: {symbol} {timeframe} {prediction['direction']} "
+                                      f"Confidence: {prediction['confidence']:.2f}")
+                except Exception as e:
+                    print(f"Scan error for {symbol} {timeframe}: {e}")
+        return signals
+    def run_trading_loop(self):
+        """Main trading loop"""
+        print("Starting trading loop...")
+        while True:
+            try:
+                # 1. Check system status
+                if not self.check_system_status():
+                    time.sleep(60)
+                    continue
+                # 2. Scan for opportunities
+                signals = self.scan_all_symbols()
+                # 3. Execute trades
+                for signal in signals:
+                    if self._passes_filters(signal):
+                        trade_id = self._execute_enhanced_trade(signal)
+                        if trade_id:
+                            print(f"Executed trade {trade_id}")
+                # 4. Monitor open positions
+                self.check_completed_trades()
+                # 5. Update learning system
+                self.update_enhanced_learning_system()
+                # 6. Sleep until next cycle
+                time.sleep(30)
+            except Exception as e:
+                print(f"Trading loop error: {e}")
+                time.sleep(60)
+    def create_performance_dashboard(self):
+        """Create comprehensive performance monitoring dashboard"""
+        try:
+            # Define dashboard creation logic
+            def generate_dashboard():
+                """Generate performance dashboard text report"""
+                if not hasattr(self, 'performance_dashboard_data'):
+                    self.performance_dashboard_data = {
+                        'last_updated': datetime.now(),
+                        'update_interval': 60*60,  # Update hourly
+                        'metrics': {}
+                    }
+                # Check if update is needed
+                now = datetime.now()
+                if ((now - self.performance_dashboard_data['last_updated']).total_seconds() < 
+                    self.performance_dashboard_data['update_interval']):
+                    # Use cached data if recent
+                    return self._format_dashboard(self.performance_dashboard_data['metrics'])
+                # Calculate fresh metrics
+                metrics = {}
+                # Account metrics
+                if mt5:
+                    account = mt5.account_info()
+                    if account:
+                        metrics['account'] = {
+                            'balance': account.balance,
+                            'equity': account.equity,
+                            'margin_level': account.margin_level,
+                            'free_margin': account.margin_free
+                        }
+                # Trading metrics
+                if self.trade_history:
+                    recent_trades = self.trade_history[-100:]
+                    total_trades = len(recent_trades)
+                    winning_trades = sum(1 for t in recent_trades if t.get('actual_outcome', 0) == 1)
+                    metrics['trading'] = {
+                        'total_trades': total_trades,
+                        'win_rate': winning_trades / total_trades if total_trades else 0,
+                        'avg_win': np.mean([t.get('pnl', 0) for t in recent_trades if t.get('actual_outcome', 0) == 1]) if winning_trades else 0,
+                        'avg_loss': np.mean([abs(t.get('pnl', 0)) for t in recent_trades if t.get('actual_outcome', 0) == 0]) if total_trades - winning_trades else 0,
+                        'profit_factor': sum(t.get('pnl', 0) for t in recent_trades if t.get('pnl', 0) > 0) / 
+                                        abs(sum(t.get('pnl', 0) for t in recent_trades if t.get('pnl', 0) < 0)) 
+                                        if abs(sum(t.get('pnl', 0) for t in recent_trades if t.get('pnl', 0) < 0)) > 0 else 0
+                    }
+                # ULTRA_FORCED metrics
+                if hasattr(self, 'ultra_forced_patterns'):
+                    uf_trades = sum(1 for t in self.trade_history if t.get('setup_type') == 'ULTRA_FORCED')
+                    uf_wins = sum(1 for t in self.trade_history if t.get('setup_type') == 'ULTRA_FORCED' and t.get('actual_outcome', 0) == 1)
+                    metrics['ultra_forced'] = {
+                        'total_trades': uf_trades,
+                        'win_rate': uf_wins / uf_trades if uf_trades else 0,
+                        'best_rsi_range': self._get_best_ultra_forced_rsi_range()
+                    }
+                # Model metrics
+                metrics['models'] = {model: self._get_model_accuracy(model) for model in self.models}
+                # Store metrics
+                self.performance_dashboard_data['metrics'] = metrics
+                self.performance_dashboard_data['last_updated'] = now
+                return self._format_dashboard(metrics)
+
+            def _format_dashboard(metrics):
+                """Format dashboard metrics as text"""
+                lines = []
+                lines.append("\n" + "="*60)
+                lines.append("📊 PERFORMANCE DASHBOARD".center(60))
+                lines.append("="*60)
+                if 'account' in metrics:
+                    acct = metrics['account']
+                    lines.append("\n💰 ACCOUNT METRICS")
+                    lines.append(f"Balance: ${acct['balance']:.2f}")
+                    lines.append(f"Equity: ${acct['equity']:.2f}")
+                    lines.append(f"Margin Level: {acct['margin_level']:.1f}%")
+                    lines.append(f"Free Margin: ${acct['free_margin']:.2f}")
+                if 'trading' in metrics:
+                    trading = metrics['trading']
+                    lines.append("\n📈 TRADING METRICS")
+                    lines.append(f"Total Trades: {trading['total_trades']}")
+                    lines.append(f"Win Rate: {trading['win_rate']:.1%}")
+                    lines.append(f"Avg Win: ${trading['avg_win']:.2f}")
+                    lines.append(f"Avg Loss: ${trading['avg_loss']:.2f}")
+                    lines.append(f"Profit Factor: {trading['profit_factor']:.2f}")
+                if 'ultra_forced' in metrics:
+                    uf = metrics['ultra_forced']
+                    lines.append("\n🎯 ULTRA_FORCED METRICS")
+                    lines.append(f"Total ULTRA_FORCED Trades: {uf['total_trades']}")
+                    lines.append(f"Win Rate: {uf['win_rate']:.1%}")
+                    lines.append(f"Best RSI Range: {uf['best_rsi_range']}")
+                if 'models' in metrics:
+                    lines.append("\n🤖 MODEL METRICS")
+                    for model, accuracy in metrics['models'].items():
+                        lines.append(f"{model}: {accuracy:.1%} accuracy")
+                lines.append("\n" + "="*60)
+                return "\n".join(lines)
+
+            def _get_model_accuracy(model_name):
+                """Get accuracy for a specific model"""
+                if not self.trade_history or model_name not in self.models:
+                    return 0.0
+                # Get trades where this model was the primary decision maker
+                model_trades = [t for t in self.trade_history 
+                               if t.get('primary_model') == model_name]
+                # If none found, check all trades
+                if not model_trades:
+                    return 0.0
+                wins = sum(1 for t in model_trades if t.get('actual_outcome', 0) == 1)
+                return wins / len(model_trades) if model_trades else 0
+
+            def _get_best_ultra_forced_rsi_range():
+                """Get best performing RSI range for ULTRA_FORCED setups"""
+                if not hasattr(self, 'ultra_forced_patterns'):
+                    return "Unknown"
+                patterns = self.ultra_forced_patterns
+                if 'rsi_buckets' not in patterns:
+                    return "Unknown"
+                # Find bucket with at least 5 trades and highest win rate
+                best_bucket = None
+                best_win_rate = 0
+                for bucket, data in patterns['rsi_buckets'].items():
+                    if data['trades'] >= 5 and data['win_rate'] > best_win_rate:
+                        best_bucket = bucket
+                        best_win_rate = data['win_rate']
+                return f"{best_bucket} ({best_win_rate:.1%})" if best_bucket else "Unknown"
+
+            # Attach methods to the class
+            self._format_dashboard = _format_dashboard
+            self._get_model_accuracy = _get_model_accuracy
+            self._get_best_ultra_forced_rsi_range = _get_best_ultra_forced_rsi_range
+            self.generate_dashboard = generate_dashboard
+        except Exception as e:
+            print(f"❌ Error creating dashboard: {e}")
+    def optimize_ultra_forced_strategy(self):
+        """Optimize the ULTRA_FORCED strategy based on performance analysis"""
+        # Implement specialized exit strategies for ULTRA_FORCED setups
+        def optimize_ultra_forced_exit_strategy(setup_type, win_rate, rsi, symbol):
+            """Get optimized exit parameters based on setup performance"""
+            # Base parameters
+            tp_multiplier = 3.0  # Default TP at 3x SL distance
+            sl_atr_multiplier = 1.0  # Default SL at 1x ATR
+            trailing_activation = 0.5  # Activate trailing at 50% of TP
+            # Adjust based on win rate
+            if win_rate > 0.45:  # Higher win rate - can be more aggressive
+                tp_multiplier = 4.0
+                sl_atr_multiplier = 0.8  # Tighter stop
+                trailing_activation = 0.3  # Earlier trailing
+            elif win_rate < 0.35:  # Lower win rate - be more conservative
+                tp_multiplier = 2.5  # Lower target
+                sl_atr_multiplier = 1.2  # Wider stop
+                trailing_activation = 0.7  # Later trailing
+            # Adjust based on RSI extremes
+            if rsi > 85 or rsi < 15:  # Super extreme
+                tp_multiplier += 0.5  # Increase target for extreme RSI
+                trailing_activation -= 0.1  # Earlier trailing
+            # Symbol-specific adjustments
+            if 'XAU' in symbol:
+                # Gold tends to have larger moves but needs wider stops
+                tp_multiplier *= 1.2
+                sl_atr_multiplier *= 1.3
+            elif 'EUR' in symbol:
+                # EURUSD needs tighter management
+                tp_multiplier *= 0.9
+                sl_atr_multiplier *= 0.8
+            return {
+                'tp_multiplier': tp_multiplier,
+                'sl_atr_multiplier': sl_atr_multiplier,
+                'trailing_activation': trailing_activation,
+                'take_partial': win_rate > 0.4  # Take partial profits if win rate is good
+            }
+        # Store the function for later use
+        self.optimize_ultra_forced_exit_strategy = optimize_ultra_forced_exit_strategy
+
+        # Adapt the ULTRA_FORCED detection parameters based on market conditions
+        def adaptive_ultra_forced_parameters(market_conditions):
+            """Adapt ULTRA_FORCED parameters based on market conditions"""
+            # Get default thresholds
+            thresholds = self.get_optimized_ultra_forced_thresholds().copy()
+            # Adjust based on volatility
+            volatility = market_conditions.get('volatility_regime', 'normal')
+            if volatility == 'high':
+                # In high volatility, RSI can go to more extreme levels
+                thresholds['oversold_min'] -= 5
+                thresholds['oversold_max'] -= 3
+                thresholds['overbought_min'] += 3
+                thresholds['overbought_max'] += 5
+            elif volatility == 'low':
+                # In low volatility, smaller RSI moves are significant
+                thresholds['oversold_min'] += 3
+                thresholds['oversold_max'] += 2
+                thresholds['overbought_min'] -= 2
+                thresholds['overbought_max'] -= 3
+            # Adjust based on trend strength
+            trend = market_conditions.get('trend_regime', 'neutral')
+            if trend == 'strong_uptrend':
+                # In strong uptrend, focus more on oversold conditions
+                thresholds['oversold_min'] += 5
+                thresholds['oversold_max'] += 3
+            elif trend == 'strong_downtrend':
+                # In strong downtrend, focus more on overbought conditions
+                thresholds['overbought_min'] -= 3
+                thresholds['overbought_max'] -= 5
+            return thresholds
+        # Store the function for later use
+        self.adaptive_ultra_forced_parameters = adaptive_ultra_forced_parameters
+    def enhance_ml_models(self):
+        """Implement enhancements to ML models"""
+        # 1. Feature importance analysis
+        def analyze_feature_importance():
+            """Analyze and store feature importance"""
+            if not all(model is not None for model in self.models.values()):
+                return
+            feature_importance = {}
+            for model_name, model in self.models.items():
+                if hasattr(model, 'feature_importances_'):
+                    # For tree-based models
+                    importances = model.feature_importances_
+                    for i, importance in enumerate(importances):
+                        if i < len(self.feature_columns):
+                            feature_name = self.feature_columns[i]
+                            if feature_name not in feature_importance:
+                                feature_importance[feature_name] = []
+                            feature_importance[feature_name].append(importance)
+            # Average importance across models
+            avg_importance = {}
+            for feature, values in feature_importance.items():
+                avg_importance[feature] = sum(values) / len(values)
+            # Sort by importance
+            sorted_features = sorted(avg_importance.items(), key=lambda x: x[1], reverse=True)
+            # Store top features
+            self.top_features = [f[0] for f in sorted_features[:20]]
+            if self.debug_mode:
+                print("📊 Top 10 features by importance:")
+                for feature, importance in sorted_features[:10]:
+                    print(f"   {feature}: {importance:.4f}")
+        # Store the function for later use
+        self.analyze_feature_importance = analyze_feature_importance
+
+        # 2. Improved online learning
+        def enhanced_online_learning(features, target, confidence=None):
+            """Enhanced online learning with importance weighting"""
+            try:
+                with self.model_lock:
+                    features_array = np.array(features).reshape(1, -1)
+                    target_array = np.array([target])
+                    # Weight samples by confidence - give more importance to high confidence predictions
+                    sample_weight = None
+                    if confidence is not None:
+                        # If prediction was wrong with high confidence, give it more weight to learn from
+                        if (confidence > 0.7 and target == 0) or (confidence < 0.3 and target == 1):
+                            sample_weight = np.array([2.0])  # Double importance for wrong high-confidence predictions
+                        else:
+                            sample_weight = np.array([1.0])
+                    if not self.online_model_initialized:
+                        self.online_model.partial_fit(features_array, target_array, classes=np.array([0, 1]))
+                        self.online_model_initialized = True
+                        print("🧠 Online model initialized")
+                    else:
+                        self.online_model.partial_fit(features_array, target_array, sample_weight=sample_weight)
+                    if self.debug_mode:
+                        print(f"🔄 Online model updated with target: {target}" + 
+                              (f", weight: {sample_weight[0]}" if sample_weight is not None else ""))
+            except Exception as e:
+                self.logger.error(f"Enhanced online learning error: {e}")
+        # Replace the original method
+        self.enhanced_online_learning = enhanced_online_learning
+        self.online_partial_fit = enhanced_online_learning
+    # 1. Enhanced Market Regime Detection
+    def detect_market_regime(self, market_data, lookback=100):
+        """Detect current market regime using multiple indicators"""
+        volatility = market_data['atr'].rolling(lookback).std() / market_data['atr'].rolling(lookback).mean()
+        trend_strength = abs(market_data['close'].rolling(lookback).mean() - market_data['close']) / market_data['atr']
+        # Classify market conditions
+        if volatility.iloc[-1] > 1.5:
+            regime = 'high_volatility'
+        elif trend_strength.iloc[-1] > 2.0:
+            regime = 'strong_trend'
+        elif volatility.iloc[-1] < 0.5:
+            regime = 'low_volatility_range'
+        else:
+            regime = 'normal'
+        return regime, {
+            'volatility_score': volatility.iloc[-1],
+            'trend_strength': trend_strength.iloc[-1],
+            'regime': regime
+        }
+
+    # 2. Volatility-Adjusted Position Sizing
+    def calculate_volatility_adjusted_position(self, symbol, account_balance, risk_percentage, confidence):
+        """Calculate position size based on recent volatility"""
+        # Get recent ATR for volatility measurement
+        market_data = self.get_live_market_data(symbol, 'H1', bars=50)
+        if market_data is None or len(market_data) < 20:
+            return self._calculate_enhanced_position_size(confidence, mt5.account_info(), symbol)
+        # Calculate normalized ATR
+        atr = market_data['atr'].mean()
+        normalized_atr = atr / market_data['close'].iloc[-1]
+        # Adjust risk based on volatility
+        volatility_factor = 1.0 / (normalized_atr * 200)  # Scale factor
+        volatility_factor = max(0.5, min(2.0, volatility_factor))  # Limit adjustment range
+        # Apply to position calculation
+        adjusted_risk = risk_percentage * volatility_factor
+        adjusted_risk = min(adjusted_risk, risk_percentage * 1.5)  # Cap maximum risk
+        dollar_risk = account_balance * adjusted_risk
+        return dollar_risk / (atr * 10)  # Convert to position size
+
+    # 3. Adaptive Threshold Management
+    def optimize_thresholds_based_on_performance(self):
+        """Dynamically adjust thresholds based on recent performance"""
+        if len(self.trade_history) < 50:
+            return  # Not enough data
+        # Analyze last 50 trades
+        recent_trades = self.trade_history[-50:]
+        win_rate = sum(1 for t in recent_trades if t.get('actual_outcome') == 1) / len(recent_trades)
+        # Adjust thresholds based on performance
+        for symbol in self.asset_thresholds:
+            if isinstance(self.asset_thresholds[symbol], float):
+                # Single threshold
+                if win_rate < 0.4:
+                    # Increase threshold when performance is poor
+                    self.asset_thresholds[symbol] = min(0.55, self.asset_thresholds[symbol] + 0.03)
+                elif win_rate > 0.6:
+                    # Decrease threshold when performance is good
+                    self.asset_thresholds[symbol] = max(0.25, self.asset_thresholds[symbol] - 0.02)
+                if self.debug_mode:
+                    print(f"🎯 Adjusted threshold for {symbol}: {self.asset_thresholds[symbol]:.2f}")
     # Example usage for fixing '.get' on possibly-float objects:
     # Replace: value = obj.get('key', default)
     # With:    value = self._safe_get(obj, 'key', default)
@@ -1281,7 +1781,10 @@ class EnhancedAdaptiveMLTradingSystem:
             return self.get_optimized_threshold(symbol, timeframe, market_conditions)
             
         # Fall back to basic threshold adjustment
-        base_threshold = self.confidence_threshold
+        if isinstance(self.confidence_threshold, dict):
+            base_threshold = self.confidence_threshold.get(symbol, 0.3)
+        else:
+            base_threshold = self.confidence_threshold
         
         # Performance-based adjustment
         if len(self.trade_history) >= 10:
@@ -1306,7 +1809,7 @@ class EnhancedAdaptiveMLTradingSystem:
             base_threshold -= 0.01  # Slightly more aggressive for higher timeframes
 
         # Ensure reasonable bounds  
-        return max(0.30, min(0.90, base_threshold))  # Wider bounds for small accounts
+        return max(0.30, min(0.55, base_threshold))  # Max threshold capped at 0.55
 
     def advanced_threshold_learning(self, symbol, timeframe, market_conditions):
         """Learn optimal confidence thresholds based on market conditions and performance"""
@@ -1332,7 +1835,7 @@ class EnhancedAdaptiveMLTradingSystem:
             # Initialize condition tracking if new
             if condition_key not in self.threshold_performance['conditions']:
                 self.threshold_performance['conditions'][condition_key] = {
-                    'thresholds': {t/100: {'trades': 0, 'wins': 0} for t in range(30, 95, 5)},
+                    'thresholds': {t/100: {'trades': 0, 'wins': 0} for t in range(30, 56, 5)},
                     'optimal_threshold': 0.5,
                     'total_trades': 0,
                     'successful_trades': 0,
@@ -1358,7 +1861,7 @@ class EnhancedAdaptiveMLTradingSystem:
                 
                 # Find closest threshold bucket
                 threshold_bucket = round(confidence * 20) / 20  # Round to nearest 0.05
-                threshold_bucket = max(0.3, min(0.9, threshold_bucket))  # Keep within bounds
+                threshold_bucket = max(0.3, min(0.55, threshold_bucket))  # Keep within bounds
                 
                 if threshold_bucket in condition_data['thresholds']:
                     condition_data['thresholds'][threshold_bucket]['trades'] += 1
@@ -1516,7 +2019,7 @@ class EnhancedAdaptiveMLTradingSystem:
             final_threshold = condition_threshold + symbol_adj + timeframe_adj
             
             # Ensure reasonable bounds
-            return max(0.3, min(0.9, final_threshold))
+            return max(0.3, min(0.55, final_threshold))
             
         except Exception as e:
             self.logger.error(f"Error getting optimized threshold: {e}")
@@ -1576,7 +2079,7 @@ class EnhancedAdaptiveMLTradingSystem:
             extreme_vol_threshold = 0.005  # Higher ATR tolerance
             low_vol_threshold = 0.6    # Lower volume requirement
             rsi_extreme_min = 15       # Wider RSI bounds
-            rsi_extreme_max = 85
+            rsi_extreme_max = 45
         else:
             # Gradually tighten thresholds based on performance
             performance = self.get_recent_performance()
@@ -3096,7 +3599,7 @@ class EnhancedAdaptiveMLTradingSystem:
                     timeframes = self.asset_thresholds[symbol]
                     # If timeframes is a float, treat as single threshold
                     if isinstance(timeframes, float):
-                        current_threshold = self._safe_get(self.threshold_adaptation, symbol, 0.85)
+                        current_threshold = self._safe_get(self.threshold_adaptation, symbol, 0.45)
                         recent_accuracy = self._safe_get(insights, 'recent_accuracy', 0.5)
                         if recent_accuracy > 0.7:
                             new_threshold = max(0.75, current_threshold - 0.02)
@@ -3111,7 +3614,7 @@ class EnhancedAdaptiveMLTradingSystem:
                     # Otherwise, treat as dict of timeframes
                     for timeframe in timeframes:
                         symbol_thresholds = self._safe_get(self.threshold_adaptation, symbol, {})
-                        current_threshold = self._safe_get(symbol_thresholds, timeframe, 0.85) if isinstance(symbol_thresholds, dict) else 0.85
+                        current_threshold = self._safe_get(symbol_thresholds, timeframe, 0.25) if isinstance(symbol_thresholds, dict) else 0.45
                         recent_accuracy = self._safe_get(insights, 'recent_accuracy', 0.5)
                         if recent_accuracy > 0.7:
                             new_threshold = max(0.75, current_threshold - 0.02)
@@ -4486,8 +4989,8 @@ class EnhancedAdaptiveMLTradingSystem:
                     feature_vector.append(0.0)
                     missing_features.append(feature_name)
             
-            if missing_features and self.debug_mode:
-                print(f"⚠️ Missing {len(missing_features)} features, using defaults")
+            if missing_features:
+                print(f"⚠️ Missing features: {missing_features}")
             
             # Scale features with proper dimensionality handling
             feature_array = np.array(feature_vector).reshape(1, -1)
@@ -4767,8 +5270,8 @@ class EnhancedAdaptiveMLTradingSystem:
             base_threshold -= 0.02  # More aggressive on gold
         elif 'EUR' in symbol:
             base_threshold += 0.15  # Much more conservative on EURUSD
-        
-        return max(0.20, min(0.85, base_threshold))
+
+        return max(0.20, min(0.45, base_threshold))
 
     def _apply_trading_filters(self, features, symbol, timeframe, setup_direction=None, expected_win_rate=None):
         """Optimized filters to block breakouts, allow ULTRA_FORCED setups on both Gold and EURUSD."""
@@ -4945,9 +5448,9 @@ class EnhancedAdaptiveMLTradingSystem:
         
         # Timeframe-specific threshold adjustments
         self.timeframe_threshold_modifiers = {
-            'M1': 0.85,  # 15% lower threshold for M1
-            'M5': 0.90,  # 10% lower threshold for M5
-            'M15': 0.95  # 5% lower threshold for M15
+            'M1': 0.45,  # 15% lower threshold for M1
+            'M5': 0.55,  # 10% lower threshold for M5
+            'M15': 0.60  # 5% lower threshold for M15
         }
         
         # Add enhanced data requirements - Optimized for scalping
@@ -5333,7 +5836,7 @@ class EnhancedAdaptiveMLTradingSystem:
                         
                         # Apply dynamic threshold adaptation
                         symbol_thresholds = self._safe_get(self.threshold_adaptation, symbol, {})
-                        current_threshold = self._safe_get(symbol_thresholds, timeframe, 0.85) if isinstance(symbol_thresholds, dict) else 0.85
+                        current_threshold = self._safe_get(symbol_thresholds, timeframe, 0.25) if isinstance(symbol_thresholds, dict) else 0.45
                         if confidence < current_threshold:
                             print(f"🛡️ Trade blocked by adaptive threshold: {confidence:.1%} < {current_threshold:.1%}")
                             return False
@@ -5864,7 +6367,7 @@ class EnhancedAdaptiveMLTradingSystem:
             elif prob > 0.9:
                 prob = 0.9 - (0.95 - prob) * 0.5  # Soften very high probabilities
             
-            if self.debug_mode and (prob > 0.85 or prob < 0.15):
+            if self.debug_mode and (prob > 0.45 or prob < 0.15):
                 print(f"  🔧 Calibrated adaptive_learner: {prob:.3f} (was extreme)")
             
             return float(prob)
