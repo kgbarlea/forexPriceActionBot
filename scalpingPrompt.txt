@@ -1,0 +1,33 @@
+install package
+uv pip install MetaTrader5 pandas numpy opencv-python pytz scipy scikit-learn matplotlib python-telegram-bot
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe gold_scalping_mt5.py
+
+
+553653219794
+553653219794
+
+pls review my scalping program if it follow this prompt, 
+if not pls correct it to follow this pompt
+
+
+# TODO: Implement nested trend line detection - M1 lines within M5 boundaries
+# Goal: Find M1 support/resistance lines that exist INSIDE M5 channel
+# Process: Get M5 major lines, then find M1 pivot points within those boundaries
+# Filter: Only M1 lines that are between M5 support and M5 resistance
+# Output: Multiple M1 trading levels within single M5 channel
+# Expected: 3-5 M1 trading zones within each M5 channel for scalping
+def detect_nested_trend_lines(self, symbol):
+
+# TODO: Create specific trading zones between adjacent M1 trend lines
+# Logic: Sort all M1 support/resistance levels, create zones between adjacent levels
+# Validate: Zones must have minimum width (5+ points) and be within M5 boundaries
+# Purpose: Each zone becomes a scalping opportunity (buy bottom, sell top)
+# Expected: Clear entry/exit levels for rapid M1 scalping
+def create_m1_trading_zones(self, m5_structure, m1_nested_lines):
+
+# TODO: Execute M1 scalping within nested zones respecting M5 boundaries
+# Strategy: BUY at M1 support, SELL at M1 resistance, multiple times per M5 channel
+# Safety: Never trade beyond M5 boundaries (ultimate stop levels)
+# Precision: 1-2 point stops, 5-10 point targets, high frequency trading
+# Expected: 10-20 scalp trades per day with 75%+ win rate
+def execute_nested_m1_scalping(self, symbol, nested_structure, trend_alignment):
